@@ -44,6 +44,7 @@ __all__ = [
     "CapabilityRequirement",
     "Platform",
     "current_platform",
+    "detect_rocm_interconnect",
     "max_active_ctas",
     "prepare_cuda_toolkit_env",
 ]
@@ -626,7 +627,7 @@ def _detect_rocm_platform() -> PlatformInfo:
         }.get(arch, getattr(props, "max_shared_memory_per_block", 0)),
         sm_features=sm_features,
         runtime_features=runtime_features,
-        interconnect=_detect_rocm_interconnect(),
+        interconnect=detect_rocm_interconnect(),
     )
 
 
@@ -703,42 +704,97 @@ def _detect_cuda_interconnect() -> InterconnectInfo | None:
         return None
 
 
-def _detect_rocm_interconnect() -> InterconnectInfo | None:
-    """Detect ROCm multi-GPU interconnect topology."""
+_KFD_TOPOLOGY_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+_KFD_LINK_TYPE_XGMI = 11
+
+
+def detect_rocm_interconnect(
+    nodes_dir: Path = _KFD_TOPOLOGY_NODES,
+) -> InterconnectInfo | None:
+    """Detect the interconnect between the visible AMD GPUs.
+
+    The KFD topology contains links to CPUs as well as links between GPUs, so
+    this checks only pairs of GPU nodes.  ``None`` means that the topology
+    could not be read; callers must not treat an unknown topology as PCIe.
+    """
     try:
         import torch
 
         device_count = torch.cuda.device_count()
-        if device_count <= 1:
-            return InterconnectInfo(topology="single_gpu")
-        # Probe /sys/class/kfd for xGMI links (HSA_IOLINK_TYPE_XGMI = 11).
-        try:
-            import os as _os
-
-            kfd_root = "/sys/class/kfd/kfd/topology/nodes"
-            xgmi_count = 0
-            for node in _os.listdir(kfd_root):
-                links_dir = _os.path.join(kfd_root, node, "io_links")
-                if not _os.path.isdir(links_dir):
-                    continue
-                for link in _os.listdir(links_dir):
-                    pf = _os.path.join(links_dir, link, "properties")
-                    try:
-                        with open(pf) as f:
-                            for line in f:
-                                if line.startswith("type ") and line.split()[1] == "11":
-                                    xgmi_count += 1
-                    except OSError:
-                        continue
-            if xgmi_count > 0:
-                full = device_count * (device_count - 1)
-                topo = "xgmi_full" if xgmi_count >= full else "xgmi_pairs"
-                return InterconnectInfo(topology=topo)
-        except Exception:
-            pass
-        return InterconnectInfo(topology="pcie")
-    except Exception:
+    except (ImportError, RuntimeError):
         return None
+    if device_count <= 1:
+        return InterconnectInfo(topology="single_gpu")
+
+    gpu_nodes = _kfd_gpu_nodes(nodes_dir)
+    if len(gpu_nodes) < device_count:
+        return None
+
+    xgmi_pairs = 0
+    total_pairs = device_count * (device_count - 1) // 2
+    link_types = {
+        gpu: _kfd_link_types(nodes_dir / str(gpu)) for gpu in gpu_nodes[:device_count]
+    }
+    for index, gpu in enumerate(gpu_nodes[:device_count]):
+        for peer in gpu_nodes[index + 1 : device_count]:
+            if link_types[gpu].get(peer) == _KFD_LINK_TYPE_XGMI or link_types[
+                peer
+            ].get(gpu) == _KFD_LINK_TYPE_XGMI:
+                xgmi_pairs += 1
+
+    if xgmi_pairs == 0:
+        topology = "pcie"
+    elif xgmi_pairs == total_pairs:
+        topology = "xgmi_full"
+    else:
+        topology = "xgmi_pairs"
+    return InterconnectInfo(topology=topology)
+
+
+def _kfd_gpu_nodes(nodes_dir: Path) -> list[int]:
+    """Return KFD node ids that represent GPUs."""
+    if not nodes_dir.is_dir():
+        return []
+    gpu_nodes = []
+    for node in nodes_dir.iterdir():
+        if not node.name.isdigit():
+            continue
+        properties = node / "properties"
+        try:
+            values = dict(
+                line.split(maxsplit=1)
+                for line in properties.read_text().splitlines()
+                if " " in line
+            )
+        except (OSError, ValueError):
+            continue
+        try:
+            is_gpu = int(values.get("gfx_target_version", "0")) != 0
+        except ValueError:
+            continue
+        if is_gpu:
+            gpu_nodes.append(int(node.name))
+    return sorted(gpu_nodes)
+
+
+def _kfd_link_types(node_dir: Path) -> dict[int, int]:
+    """Return peer node id to link type for one KFD node."""
+    links = {}
+    for link_dir_name in ("io_links", "p2p_links"):
+        links_dir = node_dir / link_dir_name
+        if not links_dir.is_dir():
+            continue
+        for link in links_dir.iterdir():
+            try:
+                values = dict(
+                    line.split(maxsplit=1)
+                    for line in (link / "properties").read_text().splitlines()
+                    if " " in line
+                )
+                links[int(values["node_to"])] = int(values["type"])
+            except (KeyError, OSError, ValueError):
+                continue
+    return links
 
 
 def _detect_cuda_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:

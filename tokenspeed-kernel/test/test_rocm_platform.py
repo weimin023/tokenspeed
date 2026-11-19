@@ -23,7 +23,11 @@ from unittest.mock import patch
 
 import pytest
 import tokenspeed_kernel.platform as platform_module
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    detect_rocm_interconnect,
+)
 
 
 @pytest.fixture
@@ -105,3 +109,59 @@ def test_unknown_amd_architecture_is_rejected(detect_amd):
         RuntimeError, match="unsupported AMD GPU architecture 'gfx9999'"
     ):
         detect_amd("gfx9999")
+
+
+def _write_kfd_topology(nodes_dir, gpu_count, xgmi_pairs=()):
+    for node_id in range(gpu_count):
+        node_dir = nodes_dir / str(node_id)
+        node_dir.mkdir(parents=True)
+        (node_dir / "properties").write_text("gfx_target_version 95000\n")
+        links_dir = node_dir / "io_links"
+        for peer_id in range(node_id + 1, gpu_count):
+            link_dir = links_dir / str(peer_id)
+            link_dir.mkdir(parents=True)
+            link_type = 11 if (node_id, peer_id) in xgmi_pairs else 12
+            (link_dir / "properties").write_text(
+                f"node_to {peer_id}\ntype {link_type}\n"
+            )
+
+
+@pytest.mark.parametrize(
+    "gpu_count,xgmi_pairs,expected",
+    [
+        (2, (), "pcie"),
+        (3, ((0, 1), (0, 2), (1, 2)), "xgmi_full"),
+        (3, ((0, 1),), "xgmi_pairs"),
+    ],
+)
+
+
+def test_rocm_interconnect_detection(
+    tmp_path, monkeypatch, gpu_count, xgmi_pairs, expected
+):
+    nodes_dir = tmp_path / "nodes"
+    nodes_dir.mkdir()
+    _write_kfd_topology(nodes_dir, gpu_count, xgmi_pairs)
+    monkeypatch.setattr("torch.cuda.device_count", lambda: gpu_count)
+
+    interconnect = detect_rocm_interconnect(nodes_dir)
+
+    assert interconnect is not None
+    assert interconnect.topology == expected
+
+
+def test_rocm_interconnect_detection_returns_unknown_for_unreadable_topology(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 2)
+
+    assert detect_rocm_interconnect(tmp_path / "missing") is None
+
+
+def test_rocm_interconnect_detection_handles_single_gpu(tmp_path, monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+
+    interconnect = detect_rocm_interconnect(tmp_path / "missing")
+
+    assert interconnect is not None
+    assert interconnect.topology == "single_gpu"
