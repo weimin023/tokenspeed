@@ -111,57 +111,140 @@ def test_unknown_amd_architecture_is_rejected(detect_amd):
         detect_amd("gfx9999")
 
 
-def _write_kfd_topology(nodes_dir, gpu_count, xgmi_pairs=()):
-    for node_id in range(gpu_count):
+def _pci_props(bus):
+    return SimpleNamespace(pci_domain_id=0, pci_bus_id=bus, pci_device_id=0)
+
+
+def _write_kfd_topology(nodes_dir, links):
+    """Write CPU node 0 and GPU nodes 1..4; ``links`` maps (node, dir) to links.
+
+    GPU node ``n`` sits on PCI bus ``n``; ``links[(n, "io_links")]`` is a list of
+    ``(node_to, type)``.
+    """
+    cpu = nodes_dir / "0"
+    cpu.mkdir(parents=True)
+    (cpu / "properties").write_text("gfx_target_version 0\ndomain 0\nlocation_id 0\n")
+    for node_id in range(1, 5):
         node_dir = nodes_dir / str(node_id)
-        node_dir.mkdir(parents=True)
-        (node_dir / "properties").write_text("gfx_target_version 95000\n")
-        links_dir = node_dir / "io_links"
-        for peer_id in range(node_id + 1, gpu_count):
-            link_dir = links_dir / str(peer_id)
-            link_dir.mkdir(parents=True)
-            link_type = 11 if (node_id, peer_id) in xgmi_pairs else 12
-            (link_dir / "properties").write_text(
-                f"node_to {peer_id}\ntype {link_type}\n"
-            )
+        node_dir.mkdir()
+        (node_dir / "properties").write_text(
+            f"gfx_target_version 90500\ndomain 0\nlocation_id {node_id << 8}\n"
+        )
+        for link_dir_name in ("io_links", "p2p_links"):
+            for index, (node_to, link_type) in enumerate(
+                links.get((node_id, link_dir_name), ())
+            ):
+                link_dir = node_dir / link_dir_name / str(index)
+                link_dir.mkdir(parents=True)
+                (link_dir / "properties").write_text(
+                    f"type {link_type}\nnode_to {node_to}\n"
+                )
 
 
-@pytest.mark.parametrize(
-    "gpu_count,xgmi_pairs,expected",
-    [
-        (2, (), "pcie"),
-        (3, ((0, 1), (0, 2), (1, 2)), "xgmi_full"),
-        (3, ((0, 1),), "xgmi_pairs"),
-    ],
-)
+def _detect_interconnect(nodes_dir, visible_buses):
+    with (
+        patch("torch.cuda.device_count", return_value=len(visible_buses)),
+        patch(
+            "torch.cuda.get_device_properties",
+            side_effect=lambda device: _pci_props(visible_buses[device]),
+        ),
+    ):
+        return detect_rocm_interconnect(nodes_dir)
 
 
-def test_rocm_interconnect_detection(
-    tmp_path, monkeypatch, gpu_count, xgmi_pairs, expected
-):
-    nodes_dir = tmp_path / "nodes"
-    nodes_dir.mkdir()
-    _write_kfd_topology(nodes_dir, gpu_count, xgmi_pairs)
-    monkeypatch.setattr("torch.cuda.device_count", lambda: gpu_count)
-
-    interconnect = detect_rocm_interconnect(nodes_dir)
-
+def _topology(interconnect):
     assert interconnect is not None
-    assert interconnect.topology == expected
+    return interconnect.topology
 
 
-def test_rocm_interconnect_detection_returns_unknown_for_unreadable_topology(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr("torch.cuda.device_count", lambda: 2)
+def test_rocm_interconnect_pcie(tmp_path):
+    links = {(1, "io_links"): [(2, 2)], (2, "io_links"): [(1, 2)]}
+    _write_kfd_topology(tmp_path, links)
 
-    assert detect_rocm_interconnect(tmp_path / "missing") is None
+    assert _topology(_detect_interconnect(tmp_path, [1, 2])) == "pcie"
 
 
-def test_rocm_interconnect_detection_handles_single_gpu(tmp_path, monkeypatch):
-    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+def test_rocm_interconnect_full_xgmi(tmp_path):
+    links = {
+        (1, "io_links"): [(2, 11), (3, 11)],
+        (2, "io_links"): [(1, 11), (3, 11)],
+        (3, "io_links"): [(1, 11), (2, 11)],
+    }
+    _write_kfd_topology(tmp_path, links)
 
-    interconnect = detect_rocm_interconnect(tmp_path / "missing")
+    assert _topology(_detect_interconnect(tmp_path, [1, 2, 3])) == "xgmi_full"
 
-    assert interconnect is not None
-    assert interconnect.topology == "single_gpu"
+
+def test_rocm_interconnect_partial_xgmi(tmp_path):
+    links = {(1, "io_links"): [(2, 11), (3, 2)]}
+    _write_kfd_topology(tmp_path, links)
+
+    assert _topology(_detect_interconnect(tmp_path, [1, 2, 3])) == "xgmi_pairs"
+
+
+def test_rocm_interconnect_counts_one_sided_xgmi_link(tmp_path):
+    _write_kfd_topology(tmp_path, {(2, "io_links"): [(1, 11)]})
+
+    assert _topology(_detect_interconnect(tmp_path, [1, 2])) == "xgmi_full"
+
+
+def test_rocm_interconnect_reads_p2p_links(tmp_path):
+    _write_kfd_topology(tmp_path, {(1, "p2p_links"): [(2, 11)]})
+
+    assert _topology(_detect_interconnect(tmp_path, [1, 2])) == "xgmi_full"
+
+
+def test_rocm_interconnect_p2p_link_does_not_hide_io_xgmi_link(tmp_path):
+    links = {(1, "io_links"): [(2, 11)], (1, "p2p_links"): [(2, 2)]}
+    _write_kfd_topology(tmp_path, links)
+
+    assert _topology(_detect_interconnect(tmp_path, [1, 2])) == "xgmi_full"
+
+
+def test_rocm_interconnect_follows_visible_devices(tmp_path):
+    # Only GPUs 1 and 2 are XGMI connected; GPUs 3 and 4 are not.
+    links = {(1, "io_links"): [(2, 11)], (3, "io_links"): [(4, 2)]}
+    _write_kfd_topology(tmp_path, links)
+
+    assert _topology(_detect_interconnect(tmp_path, [1, 2])) == "xgmi_full"
+    assert _topology(_detect_interconnect(tmp_path, [3, 4])) == "pcie"
+    # The visible order does not have to follow the KFD node order.
+    assert _topology(_detect_interconnect(tmp_path, [4, 2])) == "pcie"
+
+
+def test_rocm_interconnect_ignores_cpu_links(tmp_path):
+    links = {(0, "io_links"): [(1, 11), (2, 11)], (1, "io_links"): [(0, 11)]}
+    _write_kfd_topology(tmp_path, links)
+
+    assert _topology(_detect_interconnect(tmp_path, [1, 2])) == "pcie"
+
+
+def test_rocm_interconnect_single_gpu_does_not_read_kfd(tmp_path):
+    with patch("torch.cuda.device_count", return_value=1):
+        interconnect = detect_rocm_interconnect(tmp_path / "missing")
+
+    assert _topology(interconnect) == "single_gpu"
+
+
+def test_rocm_interconnect_unknown_without_kfd_topology(tmp_path):
+    assert _detect_interconnect(tmp_path / "missing", [1, 2]) is None
+
+
+def test_rocm_interconnect_unknown_when_visible_gpu_is_not_in_kfd(tmp_path):
+    _write_kfd_topology(tmp_path, {})
+
+    assert _detect_interconnect(tmp_path, [1, 9]) is None
+
+
+def test_rocm_interconnect_unknown_when_link_file_is_unreadable(tmp_path):
+    _write_kfd_topology(tmp_path, {(1, "io_links"): [(2, 11)]})
+    (tmp_path / "1" / "io_links" / "0" / "properties").unlink()
+
+    assert _detect_interconnect(tmp_path, [1, 2]) is None
+
+
+def test_rocm_interconnect_unknown_when_link_file_is_malformed(tmp_path):
+    _write_kfd_topology(tmp_path, {(1, "io_links"): [(2, 11)]})
+    (tmp_path / "1" / "io_links" / "0" / "properties").write_text("node_to 2\n")
+
+    assert _detect_interconnect(tmp_path, [1, 2]) is None
